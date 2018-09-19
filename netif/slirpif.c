@@ -1,0 +1,322 @@
+#include <lwip/tcp.h>
+#include <lwip/priv/tcp_priv.h>
+#include <lwip/udp.h>
+#include <lwip/ip4.h>
+#include <lwip/ip4_frag.h>
+#include <lwip/pbuf.h>
+#include <lwip/netif.h>
+#include <lwip/snmp.h>
+
+#include <event2/event.h>
+
+#include "netif/slirpif.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(n)	(sizeof(n) / sizeof((n)[0]))
+#endif
+
+void
+slirpif_push(struct slirpif_data *data)
+{
+	LWIP_ASSERT("slirpif depth", data->depth == 0);
+	if (data->depth++)
+		return;
+	data->orig_netif_list = netif_list;
+	data->orig_netif_default = netif_default;
+	netif_list = &data->remote;
+	netif_default = &data->remote;
+#if LWIP_TCP
+	data->orig_tcp_bound_pcbs = tcp_bound_pcbs;
+	data->orig_tcp_listen_pcbs = tcp_listen_pcbs.pcbs;
+	data->orig_tcp_active_pcbs = tcp_active_pcbs;
+	data->orig_tcp_tw_pcbs = tcp_tw_pcbs;
+	data->orig_tcp_ticks = tcp_ticks;
+
+	tcp_bound_pcbs = data->slirpif_tcp_bound_pcbs;
+	tcp_listen_pcbs.pcbs = data->slirpif_tcp_listen_pcbs;
+	tcp_active_pcbs = data->slirpif_tcp_active_pcbs;
+	tcp_tw_pcbs = data->slirpif_tcp_tw_pcbs;
+	tcp_ticks = data->slirpif_tcp_ticks;
+#endif
+#if LWIP_UDP
+	data->orig_udp_pcbs = udp_pcbs;
+	udp_pcbs = data->slirpif_udp_pcbs;
+#endif
+}
+
+void
+slirpif_pop(struct slirpif_data *data)
+{
+	LWIP_ASSERT("slirpif depth", data->depth == 1);
+	if (--data->depth)
+		return;
+	netif_list = data->orig_netif_list;
+	netif_default = data->orig_netif_default;
+#if LWIP_TCP
+	data->slirpif_tcp_bound_pcbs = tcp_bound_pcbs;
+	data->slirpif_tcp_listen_pcbs = tcp_listen_pcbs.pcbs;
+	data->slirpif_tcp_active_pcbs = tcp_active_pcbs;
+	data->slirpif_tcp_tw_pcbs = tcp_tw_pcbs;
+	data->slirpif_tcp_ticks = tcp_ticks;
+
+	tcp_bound_pcbs = data->orig_tcp_bound_pcbs;
+	tcp_listen_pcbs.pcbs = data->orig_tcp_listen_pcbs;
+	tcp_active_pcbs = data->orig_tcp_active_pcbs;
+	tcp_tw_pcbs = data->orig_tcp_tw_pcbs;
+	tcp_ticks = data->orig_tcp_ticks;
+#endif
+#if LWIP_UDP
+	data->slirpif_udp_pcbs = udp_pcbs;
+	udp_pcbs = data->orig_udp_pcbs;
+#endif
+}
+
+void
+slirpif_enqueue(struct slirpif_data *data, struct pbuf *p, struct netif *inp)
+{
+	struct pbuf **queue, *r;
+	int *n;
+	if (inp == &data->remote) {
+		queue = data->remote_queue;
+		n = &data->remote_queue_n;
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: remote\n", __func__));
+	} else {
+		queue = data->netif_queue;
+		n = &data->netif_queue_n;
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: local\n", __func__));
+	}
+
+	if (!*n) {
+		struct timeval tv = {0, 0};
+		evtimer_add(data->ev, &tv);
+	}
+
+	if (*n == ARRAY_SIZE(data->remote_queue)) {
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: Queue full, packet dropped\n", __func__));
+		pbuf_free(p);
+		return;
+	}
+
+	r = pbuf_alloc(PBUF_LINK, p->tot_len, PBUF_RAM);
+	if (!r || pbuf_copy(r, p) < 0) {
+		/*
+		 * Note: tcp_output expects pbufs not to be modified, but
+		 * tcp_input modifies headers. For now just make a copy.
+		 */
+		pbuf_free(p);
+		return;
+	}
+
+	pbuf_free(p);
+	queue[(*n)++] = r;
+}
+
+static void
+slirpif_dequeue(struct slirpif_data *data, struct netif *inp)
+{
+	struct pbuf **queue, *p;
+	int *n, i, end;
+	if (inp == &data->remote) {
+		queue = data->remote_queue;
+		n = &data->remote_queue_n;
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: remote %d\n", __func__, *n));
+	} else {
+		queue = data->netif_queue;
+		n = &data->netif_queue_n;
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: local %d\n", __func__, *n));
+	}
+
+	end = *n;
+	*n = ARRAY_SIZE(data->remote_queue); /* Don't allow new data */
+
+	for (i = 0; i < end; i++) {
+		p = queue[i];
+		inp->input(p, inp);
+	}
+
+	*n = 0; /* Reopen queue */
+}
+
+static void
+slirpif_cb(evutil_socket_t sock, short which, void *arg)
+{
+	struct slirpif_data *data = arg;
+	slirpif_push(data);
+	slirpif_dequeue(data, &data->remote);
+	slirpif_pop(data);
+	slirpif_dequeue(data, &data->netif);
+}
+
+/* Simplified version of ip4_input, necessary to block iphdr_dest checks */
+static err_t
+slirpif_remote_input(struct pbuf *p, struct netif *inp)
+{
+	const struct ip_hdr *iphdr = (const struct ip_hdr *) p->payload;
+	u16_t iphdr_hlen = IPH_HL_BYTES(iphdr);
+
+	/* copy IP addresses to aligned ip_addr_t */
+	ip_addr_copy_from_ip4(ip_data.current_iphdr_dest, iphdr->dest);
+	ip_addr_copy_from_ip4(ip_data.current_iphdr_src, iphdr->src);
+	ip_data.current_netif = inp;
+	ip_data.current_input_netif = inp;
+	ip_data.current_ip4_header = iphdr;
+	ip_data.current_ip_header_tot_len = IPH_HL_BYTES(iphdr);
+	p->if_idx = netif_get_index(inp);
+
+	if (pbuf_remove_header(p, iphdr_hlen)) {
+		pbuf_free(p);
+		return ERR_OK;
+	}
+
+	switch (IPH_PROTO(iphdr)) {
+#if LWIP_TCP
+	case IP_PROTO_TCP:
+		tcp_input(p, inp);
+		break;
+#endif
+#if LWIP_ICMP
+	case IP_PROTO_UDP:
+		udp_input(p, inp);
+		break;
+#endif
+	default:
+		pbuf_free(p);
+		break;
+	}
+
+	return ERR_OK;
+}
+
+static err_t
+slirpif_remote_output(struct netif *netif, struct pbuf *p, const ip_addr_t *ipaddr)
+{
+	struct slirpif_data *data = netif->state;
+
+	/* Assume ownership of pbuf */
+	pbuf_ref(p);
+
+	/* Packet was generated by our stack, switch back and pass on */
+	LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: Reinjecting packet to input [%d]\n", __func__, data->depth));
+	p->if_idx = netif_get_index(&data->netif);
+	slirpif_enqueue(data, p, &data->netif);  /* input accepts ownership */
+	LINK_STATS_INC(link.xmit);
+	LINK_STATS_INC(link.recv);
+	return ERR_OK;
+}
+
+static err_t
+slirpif_local_output(struct netif *netif, struct pbuf *p, const ip_addr_t *dest_addr)
+{
+	const struct ip_hdr *iphdr = (const struct ip_hdr *) p->payload;
+	struct slirpif_data *data = netif->state;
+	ip_addr_t src_addr;
+	u16_t iphdr_hlen = IPH_HL_BYTES(iphdr);
+	int ret;
+
+	/* Assume ownership of pbuf */
+	pbuf_ref(p);
+
+	/* Load our local tcp/udp stack */
+	slirpif_push(data);
+
+	/* Need data with protocol headers, so must defragment */
+	if ((IPH_OFFSET(iphdr) & PP_HTONS(IP_OFFMASK | IP_MF)) != 0) {
+#if IP_REASSEMBLY
+		p = ip4_reass(p);
+		if (!p) {
+			LINK_STATS_INC(link.xmit);
+			return ERR_OK;
+		}
+		iphdr = (const struct ip_hdr *) p->payload;
+		iphdr_hlen = IPH_HL_BYTES(iphdr);
+#else
+		goto dropped;
+#endif
+	}
+
+	if (pbuf_remove_header(p, iphdr_hlen))
+		goto dropped;
+
+	ip_addr_copy_from_ip4(src_addr, iphdr->src);
+
+	/* Setup any receiving PCBs as necessary */
+	switch (IPH_PROTO(iphdr)) {
+#if LWIP_TCP
+	case IP_PROTO_TCP:
+		ret = slirpif_output_tcp(data, p, &src_addr, dest_addr);
+		break;
+#endif
+#if LWIP_ICMP
+	case IP_PROTO_UDP:
+		ret = slirpif_output_udp(data, p, &src_addr, dest_addr);
+		break;
+#endif
+	default:
+		ret = -1;
+		break;
+	}
+
+	pbuf_add_header_force(p, iphdr_hlen);
+
+	if (ret == -1) {
+dropped:
+		LWIP_DEBUGF(SLIRPIF_DEBUG, ("%s: Outbound packet dropped\n", __func__));
+		pbuf_free(p);
+		LINK_STATS_INC(link.drop);
+	} else {
+		LINK_STATS_INC(link.xmit);
+		if (ret == 0)
+			/* Inject the packet into the other netif */
+			slirpif_enqueue(data, p, &data->remote);  /* input accepts ownership */
+	}
+
+	slirpif_pop(data);
+	return ERR_OK;
+}
+
+static err_t
+slirpif_remote_init(struct netif *netif)
+{
+	MIB2_INIT_NETIF(netif, snmp_ifType_other, 0);
+	netif->name[0] = 's';
+	netif->name[1] = 'r';
+
+	netif->output = slirpif_remote_output;
+	NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_DISABLE_ALL);
+	netif->flags = NETIF_FLAG_LINK_UP;
+
+	return 0;
+}
+
+static err_t
+slirpif_local_init(struct netif *netif)
+{
+	MIB2_INIT_NETIF(netif, snmp_ifType_other, 0);
+	netif->name[0] = 's';
+	netif->name[1] = 'l';
+
+	netif->output = slirpif_local_output;
+	NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_DISABLE_ALL);
+	netif->flags = NETIF_FLAG_LINK_UP;
+
+	return 0;
+}
+
+struct netif *
+slirpif_add(struct event_base *base)
+{
+	struct slirpif_data *data;
+	data = calloc(1, sizeof(*data));
+	data->base = base;
+	data->ev = event_new(base, -1, EV_TIMEOUT, slirpif_cb, data);
+	netif_add(&data->netif, NULL, NULL, NULL, data, slirpif_local_init, ip_input);
+	data->orig_netif_list = netif_list;
+	data->orig_netif_default = netif_default;
+	netif_list = NULL;
+	netif_default = NULL;
+	netif_add(&data->remote, IP4_ADDR_BROADCAST, NULL, NULL, data, slirpif_remote_init, slirpif_remote_input);
+	netif_set_up(&data->remote);
+	netif_list = data->orig_netif_list;
+	netif_default = data->orig_netif_default;
+	return &data->netif;
+}
