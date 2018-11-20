@@ -105,7 +105,7 @@ tunif_init(struct netif *netif)
 	if (data->ether) {
 		unsigned int seed = time(0);
 		int i;
-		
+
 		/* Random HWADDR */
 		for (i = 0; i < ETH_HWADDR_LEN; i++)
 			netif->hwaddr[i] = rand_r(&seed);
@@ -119,7 +119,7 @@ tunif_init(struct netif *netif)
 			close(data->fd);
 			return -1;
 		}
-		
+
 	}
 	return 0;
 }
