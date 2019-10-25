@@ -210,7 +210,7 @@ udptapif_ready(evutil_socket_t fd, short events, void *ctx, int raw)
 			if (free == -1) {
 				free = client->n;
 				client->n *= 2;
-				client->hw = reallocarray(client->hw, client->n, sizeof(*client->hw));
+				client->hw = realloc(client->hw, client->n * sizeof(*client->hw));
 				memset(client->hw + free, 0, sizeof(*client->hw) * free);
 			}
 			client->hw[free].addr = hdr->src;
